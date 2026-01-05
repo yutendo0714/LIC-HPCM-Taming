@@ -195,6 +195,9 @@ class HPCM(basemodel):
         self.attn_s3 = CrossAttentionCell(320*2, 320*2, window_size=8, kernel_size=1)
         
         self.context_net = nn.ModuleList(conv1x1(2*M,2*M) for _ in range(2))
+        
+        # Phase 2: Flag for collecting hierarchical latents (training only)
+        self.collect_latents = False
     
     def forward(self, x, training=None):
         if training is None:
@@ -213,12 +216,20 @@ class HPCM(basemodel):
             z_likelihoods = self.entropy_estimation(z_res_hat, self.scales_hyper)   
 
         params = self.h_s(z_hat)
-        y_res, y_q, y_hat, scales_y = self.forward_hpcm(y, params, 
-                                        self.y_spatial_prior_adaptor_list_s1, self.y_spatial_prior_s1_s2, 
-                                        self.y_spatial_prior_adaptor_list_s2, self.y_spatial_prior_s1_s2, 
-                                        self.y_spatial_prior_adaptor_list_s3, self.y_spatial_prior_s3, 
-                                        self.adaptive_params_list, self.context_net, 
-                                        )
+        
+        # Forward HPCM with optional latent collection
+        result = self.forward_hpcm(y, params, 
+                                   self.y_spatial_prior_adaptor_list_s1, self.y_spatial_prior_s1_s2, 
+                                   self.y_spatial_prior_adaptor_list_s2, self.y_spatial_prior_s1_s2, 
+                                   self.y_spatial_prior_adaptor_list_s3, self.y_spatial_prior_s3, 
+                                   self.adaptive_params_list, self.context_net)
+        
+        # Unpack results
+        if len(result) == 5:
+            y_res, y_q, y_hat, scales_y, latents_hierarchy = result
+        else:
+            y_res, y_q, y_hat, scales_y = result
+            latents_hierarchy = None
 
         x_hat = self.g_s(y_hat)
         
@@ -228,10 +239,16 @@ class HPCM(basemodel):
             y_res_hat = torch.round(y_res)
             y_likelihoods = self.entropy_estimation(y_res_hat, scales_y) 
         
-        return {
+        output = {
             "x_hat": x_hat,
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
         }
+        
+        # Add hierarchical latents for Phase 2 regularization (training only)
+        if training and latents_hierarchy is not None:
+            output["latents_hierarchy"] = latents_hierarchy
+        
+        return output
     
     def forward_hpcm(self, y, common_params, 
                               y_spatial_prior_adaptor_list_s1, y_spatial_prior_s1, 
@@ -288,6 +305,9 @@ class HPCM(basemodel):
         y_q = torch.sum(torch.stack(y_q_list_s1), dim=0)
         y_hat = torch.sum(torch.stack(y_hat_list_s1), dim=0)
         scales_hat = torch.sum(torch.stack(scale_list_s1), dim=0)
+        
+        # Phase 2: Collect s1 latent for inter-scale regularization
+        latents_s1 = y_hat.clone() if self.collect_latents else None
 
         if write:
             y_q_write_list_s1 = [self.combine_for_writing_s1(y_q_list_s1[i]) for i in range(len(y_q_list_s1))]
@@ -335,6 +355,9 @@ class HPCM(basemodel):
         y_q = torch.sum(torch.stack(y_q_list_s2), dim=0)
         y_hat = torch.sum(torch.stack(y_hat_list_s2), dim=0)
         scales_hat = torch.sum(torch.stack(scale_list_s2), dim=0)
+        
+        # Phase 2: Collect s2 latent
+        latents_s2 = y_hat.clone() if self.collect_latents else None
 
         if write:
             y_q_write_list_s2 = [self.combine_for_writing_s2(y_q_list_s2[i]) for i in range(1, len(y_q_list_s2))]
@@ -381,12 +404,20 @@ class HPCM(basemodel):
         y_q = torch.sum(torch.stack(y_q_list_s3), dim=0)
         y_hat = torch.sum(torch.stack(y_hat_list_s3), dim=0)
         scales_hat = torch.sum(torch.stack(scale_list_s3), dim=0)
+        
+        # Phase 2: Collect s3 latent
+        latents_s3 = y_hat.clone() if self.collect_latents else None
 
         if write:
             y_q_write_list_s3 = [self.combine_for_writing_s3(y_q_list_s3[i]) for i in range(1, len(y_q_list_s3))]
             scales_hat_write_list_s3 = [self.combine_for_writing_s3(scale_list_s3[i]) for i in range(1, len(scale_list_s3))]
 
             return y_q_write_list_s1 + y_q_write_list_s2 + y_q_write_list_s3, scales_hat_write_list_s1 + scales_hat_write_list_s2 + scales_hat_write_list_s3
+        
+        # Phase 2: Return hierarchical latents if collecting
+        if self.collect_latents:
+            latents_hierarchy = [latents_s1, latents_s2, latents_s3]
+            return y_res, y_q, y_hat, scales_hat, latents_hierarchy
 
         return y_res, y_q, y_hat, scales_hat
     

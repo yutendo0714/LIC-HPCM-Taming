@@ -40,6 +40,10 @@ class RateDistortionLoss(nn.Module):
         super().__init__()
         self.mse = nn.MSELoss()
         self.lmbda = lmbda
+        
+        # Phase 2: Inter-scale regularizer (initialized in main)
+        self.inter_scale_reg = None
+        self.epoch = 0
 
     def forward(self, output, target):
         N, _, H, W = target.size()
@@ -55,6 +59,17 @@ class RateDistortionLoss(nn.Module):
         out["mse_loss"] = self.mse(output["x_hat"], target)
         out["loss"] = self.lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
         out["psnr"] = 10 * (torch.log(1 * 1 / out["mse_loss"]) / np.log(10))
+        
+        # ★ Phase 2: Inter-scale regularization (after epoch 100)
+        out["inter_scale_reg"] = torch.tensor(0.0)
+        if (self.inter_scale_reg is not None and 
+            self.epoch >= 100 and 
+            "latents_hierarchy" in output and 
+            output["latents_hierarchy"] is not None):
+            
+            reg_loss = self.inter_scale_reg(output["latents_hierarchy"])
+            out["inter_scale_reg"] = reg_loss
+            out["loss"] = out["loss"] + reg_loss
 
         return out
 
@@ -86,7 +101,8 @@ class CustomDataParallel(nn.DataParallel):
             return getattr(self.module, key)
 
 def train_one_epoch(
-    model, criterion, train_dataloader, optimizer, epoch, global_step, clip_max_norm
+    model, criterion, train_dataloader, optimizer, epoch, global_step, clip_max_norm,
+    spectral_truncation=None  # Phase 1: Intra-scale frequency regularization
 ):
     model.train()
     print(model.training)
@@ -103,6 +119,11 @@ def train_one_epoch(
 
         global_step+=1
         d = d.to(device)
+        
+        # ★ Phase 1: Apply progressive frequency truncation (first 100 epochs)
+        if spectral_truncation is not None and epoch < spectral_truncation.num_epochs:
+            d = spectral_truncation.apply_truncation(d, epoch)
+        
         optimizer.zero_grad()
         out_net = model(d)
 
@@ -121,19 +142,29 @@ def train_one_epoch(
         psnr.update(out_criterion["psnr"])
         y_bpp.update(out_criterion["y_bpp"])
         z_bpp.update(out_criterion["z_bpp"])
-        wandb.log(
-            {
-                "train/loss": out_criterion["loss"].item(),
-                "train/bpp_loss": out_criterion["bpp_loss"].item(),
-                "train/mse_loss": out_criterion["mse_loss"].item(),
-                "train/psnr": out_criterion["psnr"].item(),
-                "train/y_bpp": out_criterion["y_bpp"].item(),
-                "train/z_bpp": out_criterion["z_bpp"].item(),
-                "train/lr": optimizer.param_groups[0]["lr"],
-                "epoch": epoch,
-            },
-            step=global_step,
-        )
+        # Log spectral regularization info if enabled
+        log_dict = {
+            "train/loss": out_criterion["loss"].item(),
+            "train/bpp_loss": out_criterion["bpp_loss"].item(),
+            "train/mse_loss": out_criterion["mse_loss"].item(),
+            "train/psnr": out_criterion["psnr"].item(),
+            "train/y_bpp": out_criterion["y_bpp"].item(),
+            "train/z_bpp": out_criterion["z_bpp"].item(),
+            "train/lr": optimizer.param_groups[0]["lr"],
+            "epoch": epoch,
+        }
+        
+        # Add Phase 1 spectral info
+        if spectral_truncation is not None:
+            tau = spectral_truncation.get_tau(epoch)
+            log_dict["spectral/tau"] = tau
+            log_dict["spectral/phase"] = "phase1_intra" if epoch < spectral_truncation.num_epochs else "baseline"
+        
+        # Add Phase 2 inter-scale reg info
+        if "inter_scale_reg" in out_criterion:
+            log_dict["spectral/inter_scale_reg"] = out_criterion["inter_scale_reg"].item()
+        
+        wandb.log(log_dict, step=global_step)
 
         if i % 100 == 0 :
             t_end = time.time()-t_start
@@ -282,6 +313,45 @@ def parse_args(argv):
         help="gradient clipping max norm (default: %(default)s",
     )
     parser.add_argument("--checkpoint", type=str, help="Path to a checkpoint")
+    
+    # Spectral regularization arguments (Phase 1)
+    parser.add_argument(
+        "--spectral-reg",
+        action="store_true",
+        help="Enable spectral regularization (Phase 1: Intra-scale frequency)"
+    )
+    parser.add_argument(
+        "--tau-init",
+        type=float,
+        default=0.05,
+        help="Initial frequency cutoff for spectral truncation (default: 0.05)"
+    )
+    parser.add_argument(
+        "--tau-final",
+        type=float,
+        default=1.0,
+        help="Final frequency cutoff for spectral truncation (default: 1.0)"
+    )
+    parser.add_argument(
+        "--truncation-epochs",
+        type=int,
+        default=100,
+        help="Number of epochs to apply spectral truncation (default: 100)"
+    )
+    
+    # Phase 2: Inter-scale regularization
+    parser.add_argument(
+        "--phase2-reg",
+        action="store_true",
+        help="Enable Phase 2 inter-scale latent regularization (after epoch 100)"
+    )
+    parser.add_argument(
+        "--delta",
+        type=float,
+        default=0.1,
+        help="Phase 2 inter-scale regularization weight (default: 0.1)"
+    )
+    
     args = parser.parse_args(argv)
     return args
 
@@ -343,6 +413,61 @@ def main(argv):
     print(net)
     net = net.to(device)
     wandb.watch(net, log="all", log_freq=100)
+    
+    # ★ Initialize Phase 1: Spectral Truncation (if enabled)
+    spectral_truncation = None
+    if args.spectral_reg:
+        from src.spectral_regularization import SpectralTruncation
+        spectral_truncation = SpectralTruncation(
+            tau_init=args.tau_init,
+            tau_final=args.tau_final,
+            num_epochs=args.truncation_epochs
+        )
+        print(f"\n{'='*60}")
+        print(f"Phase 1: Intra-scale Frequency Regularization ENABLED")
+        print(f"  tau_init: {args.tau_init}")
+        print(f"  tau_final: {args.tau_final}")
+        print(f"  truncation_epochs: {args.truncation_epochs}")
+        print(f"{'='*60}\n")
+        wandb.config.update({
+            "spectral_reg_phase1": True,
+            "tau_init": args.tau_init,
+            "tau_final": args.tau_final,
+            "truncation_epochs": args.truncation_epochs,
+        })
+    
+    # ★ Initialize Phase 2: Inter-scale Regularization (if enabled)
+    if args.phase2_reg:
+        from src.spectral_regularization.phase2_inter_scale import InterScaleRegularizer
+        
+        # Initialize regularizer
+        inter_scale_reg = InterScaleRegularizer(
+            delta=args.delta,
+            channels=[320, 320, 320],  # HPCM channel config
+            device=device
+        ).to(device)
+        
+        # Set in criterion
+        criterion.inter_scale_reg = inter_scale_reg
+        
+        # Enable latent collection in model
+        if hasattr(net, 'collect_latents'):
+            net.collect_latents = True
+        elif hasattr(net, 'module') and hasattr(net.module, 'collect_latents'):
+            net.module.collect_latents = True
+        
+        print(f"\n{'='*60}")
+        print(f"Phase 2: Inter-scale Latent Regularization ENABLED")
+        print(f"  delta: {args.delta}")
+        print(f"  start_epoch: 100")
+        print(f"  channels: [320, 320, 320]")
+        print(f"{'='*60}\n")
+        
+        wandb.config.update({
+            "spectral_reg_phase2": True,
+            "delta": args.delta,
+            "phase2_start_epoch": 100,
+        })
 
     # Learning rate scheduler adjusted for batch size 16
     # When batch size is halved (32->16), learning rate is also halved
@@ -401,6 +526,9 @@ def main(argv):
         
         print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
         
+        # Set epoch in criterion for Phase 2 switching
+        criterion.epoch = epoch
+        
         global_step = train_one_epoch(
             net,
             criterion,
@@ -409,6 +537,7 @@ def main(argv):
             epoch,
             global_step,
             args.clip_max_norm,
+            spectral_truncation=spectral_truncation,  # Pass Phase 1 module
         )
 
         loss = test_epoch(epoch, test_dataloader, net, criterion, global_step)
